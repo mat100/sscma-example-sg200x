@@ -38,15 +38,19 @@ private:
     std::string generateFileName();
     std::string generateImageFileName();
     bool recycle(uint32_t req_size = 0);
+    bool recycleByImageCount();  // Automatic deletion of oldest images
+    bool checkSpace(uint32_t req_size);  // Check space WITHOUT deletion
     bool openFile(videoFrame* frame);
     bool saveImage(videoFrame* frame);
     void closeFile();
 
 protected:
     std::string storage_;
+    std::string storageType_;  // "local", "external", or "shm"
     std::string saveMode_;  // "video" or "image"
     int slice_;
     int duration_;
+    int keepLastImages_;  // Image count limit (0 = unlimited)
     ma_tick_t begin_;
     ma_tick_t start_;  // For tracking interval timing
     bool manual_capture_requested_;  // For manual capture mode

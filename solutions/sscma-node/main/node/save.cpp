@@ -23,6 +23,14 @@
 #define NODE_IMAGE_PATH_EXTERNAL "/mnt/sd/Images/"
 #endif
 
+#ifndef NODE_IMAGE_PATH_SHARED_MEMORY
+#define NODE_IMAGE_PATH_SHARED_MEMORY "/dev/shm/Images/"
+#endif
+
+#ifndef NODE_DEFAULT_KEEP_LAST_IMAGES
+#define NODE_DEFAULT_KEEP_LAST_IMAGES 0  // 0 = unlimited
+#endif
+
 #ifndef NODE_SAVE_MAX_SIZE
 #define NODE_SAVE_MAX_SIZE 128 * 1024 * 1024
 #endif
@@ -40,9 +48,11 @@ static constexpr char TAG[] = "ma::node::save";
 SaveNode::SaveNode(std::string id)
     : Node("save", id),
       storage_(NODE_SAVE_PATH_LOCAL),
+      storageType_(""),
       saveMode_("video"),
       slice_(300),
       duration_(-1),
+      keepLastImages_(NODE_DEFAULT_KEEP_LAST_IMAGES),
       begin_(0),
       start_(0),
       manual_capture_requested_(false),
@@ -78,22 +88,92 @@ std::string SaveNode::generateImageFileName() {
     return oss.str();
 }
 
+bool SaveNode::recycleByImageCount() {
+    if (keepLastImages_ == 0) {
+        return true;  // Unlimited - no deletion
+    }
+
+    std::vector<std::filesystem::directory_entry> files;
+    for (const auto& p : std::filesystem::directory_iterator(storage_)) {
+        if (p.is_regular_file()) {
+            files.push_back(p);
+        }
+    }
+
+    // Sort by time (oldest first)
+    std::sort(files.begin(), files.end(),
+        [](const auto& a, const auto& b) {
+            return std::filesystem::last_write_time(a) <
+                   std::filesystem::last_write_time(b);
+        });
+
+    // Delete oldest images when exceeding limit
+    // Make room for new image, so delete when files.size() >= keepLastImages_
+    while (files.size() >= keepLastImages_) {
+        if (std::filesystem::remove(files[0])) {
+            MA_LOGI(TAG, "recycled old image (count limit): %s",
+                    files[0].path().c_str());
+        }
+        files.erase(files.begin());
+    }
+    return true;
+}
+
+bool SaveNode::checkSpace(uint32_t req_size) {
+    uint64_t avail = std::filesystem::space(storage_).available;
+
+    // For shared memory, use very small reserve (1MB) since space is limited
+    // For disk storage, keep 128MB reserve
+    uint32_t reserve = (storageType_ == "shm") ? (1 * 1024 * 1024) : NODE_MIN_AVILABLE_CAPACITY;
+
+    // Only check that we have enough for the actual image
+    if (avail < req_size) {
+        MA_LOGW(TAG, "Insufficient space: available %llu bytes, required %u bytes (no reserve)",
+                avail, req_size);
+        return false;  // Insufficient space - return error
+    }
+
+    return true;
+}
+
 bool SaveNode::saveImage(videoFrame* frame) {
     if (frame == nullptr || frame->img.data == nullptr) {
         return false;
     }
 
-    filename_ = generateImageFileName();
-    MA_LOGI(TAG, "save image to %s", filename_.c_str());
-
-    if (recycle(frame->img.size / 2) == false) {
-        MA_LOGW(TAG, "No space left on device");
+    // 1. Automatic deletion of oldest images based on keepLastImages limit
+    if (!recycleByImageCount()) {
+        MA_LOGW(TAG, "Failed to recycle images");
         return false;
     }
 
+    // 2. Check available space - WITHOUT automatic deletion
+    //    If no space, return error and stop capture
+    if (!checkSpace(frame->img.size / 2)) {
+        MA_LOGW(TAG, "Cannot save: no space left");
+        server_->response(id_, json::object({
+            {"type", MA_MSG_TYPE_RESP},
+            {"name", "save"},
+            {"code", MA_ENOMEM},
+            {"data", "No space left on device"}
+        }));
+        return false;
+    }
+
+    // 3. Generate filename
+    filename_ = generateImageFileName();
+    MA_LOGI(TAG, "save image to %s", filename_.c_str());
+
+    // 4. Save file
     std::ofstream file(filename_, std::ios::binary);
     if (!file.is_open()) {
         MA_LOGE(TAG, "could not open %s for writing", filename_.c_str());
+        server_->response(id_, json::object({
+            {"type", MA_MSG_TYPE_RESP},
+            {"name", "save"},
+            {"code", MA_EIO},
+            {"data", "Failed to open file"}
+        }));
         return false;
     }
 
@@ -102,11 +182,35 @@ bool SaveNode::saveImage(videoFrame* frame) {
 
     if (!file.good()) {
         MA_LOGE(TAG, "failed to write image data to %s", filename_.c_str());
+        server_->response(id_, json::object({
+            {"type", MA_MSG_TYPE_RESP},
+            {"name", "save"},
+            {"code", MA_EIO},
+            {"data", "Failed to write file"}
+        }));
         return false;
     }
 
+    // 5. Success - send event about saved image
     imageCount_++;
-    MA_LOGI(TAG, "image saved successfully: %s (size: %d bytes)", filename_.c_str(), frame->img.size);
+    MA_LOGI(TAG, "image saved successfully: %s (size: %d bytes)",
+            filename_.c_str(), frame->img.size);
+
+    json data = json::object({
+        {"path", filename_},
+        {"timestamp", std::time(nullptr)},
+        {"size", frame->img.size},
+        {"storage", storageType_}
+    });
+
+    MA_LOGI(TAG, "sending image_saved event for %s", filename_.c_str());
+    server_->response(id_, json::object({
+        {"type", MA_MSG_TYPE_EVT},
+        {"name", "image_saved"},
+        {"code", MA_OK},
+        {"data", data}
+    }));
+
     return true;
 }
 
@@ -475,7 +579,9 @@ void SaveNode::threadEntry() {
                             server_->response(id_, json::object({{"type", MA_MSG_TYPE_RESP}, {"name", "enabled"}, {"code", MA_OK}, {"data", enabled_.load()}}));
                         }
                     } else {
-                        MA_LOGW(TAG, "failed to save image");
+                        MA_LOGW(TAG, "failed to save image - stopping capture");
+                        enabled_ = false;
+                        server_->response(id_, json::object({{"type", MA_MSG_TYPE_RESP}, {"name", "enabled"}, {"code", MA_OK}, {"data", false}}));
                     }
                 }
 
@@ -658,15 +764,32 @@ ma_err_t SaveNode::onCreate(const json& config) {
         enabled_ = config["enabled"].get<bool>();
     }
 
-    std::string storageType = config["storage"].get<std::string>();
+    storageType_ = config["storage"].get<std::string>();
     if (saveMode_ == "image") {
-        storage_ = (storageType == "local") ? NODE_IMAGE_PATH_LOCAL : (storageType == "external") ? NODE_IMAGE_PATH_EXTERNAL : "";
+        if (storageType_ == "local") {
+            storage_ = NODE_IMAGE_PATH_LOCAL;
+        } else if (storageType_ == "external") {
+            storage_ = NODE_IMAGE_PATH_EXTERNAL;
+        } else if (storageType_ == "shm") {
+            storage_ = NODE_IMAGE_PATH_SHARED_MEMORY;
+        } else {
+            MA_THROW(Exception(MA_EINVAL, "Invalid storage type"));
+        }
     } else {
-        storage_ = (storageType == "local") ? NODE_SAVE_PATH_LOCAL : (storageType == "external") ? NODE_SAVE_PATH_EXTERNAL : "";
+        if (storageType_ == "local") {
+            storage_ = NODE_SAVE_PATH_LOCAL;
+        } else if (storageType_ == "external") {
+            storage_ = NODE_SAVE_PATH_EXTERNAL;
+        } else if (storageType_ == "shm") {
+            storage_ = NODE_IMAGE_PATH_SHARED_MEMORY;  // Video to shm not typical, but allow it
+        } else {
+            MA_THROW(Exception(MA_EINVAL, "Invalid storage type"));
+        }
     }
 
-    if (storage_.empty()) {
-        MA_THROW(Exception(MA_EINVAL, "Invalid storage type"));
+    if (config.contains("keepLastImages") && config["keepLastImages"].is_number()) {
+        keepLastImages_ = config["keepLastImages"].get<int>();
+        if (keepLastImages_ < 0) keepLastImages_ = 0;
     }
 
     if (!std::filesystem::exists(storage_) || !std::filesystem::is_directory(storage_)) {
@@ -688,7 +811,7 @@ ma_err_t SaveNode::onCreate(const json& config) {
         available = 0;
     }
 
-    MA_LOGI(TAG, "storage: %s, saveMode: %s, slice: %d duration: %d available: %ldKB", storage_.c_str(), saveMode_.c_str(), slice_, duration_, available);
+    MA_LOGI(TAG, "storage: %s, saveMode: %s, slice: %d duration: %d keepLastImages: %d available: %ldKB", storage_.c_str(), saveMode_.c_str(), slice_, duration_, keepLastImages_, available);
 
     server_->response(
         id_,
